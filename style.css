@@ -1,0 +1,45 @@
+body {
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    margin: 0;
+    background: #000;
+    color: #eee;
+}
+
+/* Obere UI-Leiste, nur vor der Dateiauswahl sichtbar */
+#uiBar {
+    padding: 0.75rem 1rem;
+    background: #111;
+    border-bottom: 1px solid #333;
+}
+
+/* PDF-Scrollbereich */
+#pdfContainer {
+    height: calc(100vh - 3rem); /* grob Platz für uiBar */
+    overflow-y: auto;
+    background: #000;
+}
+
+/* Canvas-Seiten */
+#pdfContainer canvas {
+    display: block;
+    margin: 0 auto 1rem auto;
+}
+
+/* === VIEWER MODE === */
+
+body.viewer-mode {
+    background: #000;
+}
+
+/* UI-Leiste komplett ausblenden */
+body.viewer-mode #uiBar {
+    display: none;
+}
+
+/* PDF-Container nimmt den gesamten Bildschirm ein */
+body.viewer-mode #pdfContainer {
+    position: fixed;
+    inset: 0;
+    height: 100vh;
+    overflow-y: auto;
+}
