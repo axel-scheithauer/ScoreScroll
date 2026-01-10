@@ -6,24 +6,6 @@ body {
 }
 
 /* Obere UI-Leiste, nur vor der Dateiauswahl sichtbar */
-#uiBar {
-    padding: 0.75rem 1rem;
-    background: #111;
-    border-bottom: 1px solid #333;
-}
-
-/* PDF-Scrollbereich */
-#pdfContainer {
-    height: calc(100vh - 3rem); /* grob Platz für uiBar */
-    overflow-y: auto;
-    background: #000;
-}
-
-/* Canvas-Seiten */
-#pdfContainer canvas {
-    display: block;
-    margin: 0 auto 1rem auto;
-}
 
 /* === VIEWER MODE === */
 
@@ -42,4 +24,53 @@ body.viewer-mode #pdfContainer {
     inset: 0;
     height: 100vh;
     overflow-y: auto;
+}
+
+aaaaas
+
+#uiBar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+
+  padding: 0.75rem 1rem;
+  background: #111;
+  border-bottom: 1px solid #333;
+
+  transition: opacity 250ms ease, transform 250ms ease;
+}
+
+/* UI sichtbar */
+body.ui-visible #uiBar {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+/* UI verborgen */
+body.viewer-mode #uiBar {
+  opacity: 0;
+  transform: translateY(-20px);
+  pointer-events: none;
+}
+
+/* PDF-Container: unter der UI starten, wenn UI sichtbar */
+body.ui-visible #pdfContainer {
+  position: fixed;
+  top: 3rem;          /* grob Höhe der UI */
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow-y: auto;
+  background: #000;
+}
+
+/* PDF-Container fullscreen, wenn UI verborgen */
+body.viewer-mode #pdfContainer {
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+  background: #000;
 }
