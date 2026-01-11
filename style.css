@@ -74,3 +74,20 @@ body.viewer-mode #pdfContainer {
   overflow-y: auto;
   background: #000;
 }
+
+#pdfInput {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+#pickPdfBtn {
+  font: inherit;
+  padding: 0.6rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid #444;
+  background: #1a1a1a;
+  color: #eee;
+}

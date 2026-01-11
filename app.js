@@ -12,7 +12,11 @@
 document.addEventListener("DOMContentLoaded", () => {
   const input = document.getElementById("pdfInput");
   const pdfContainer = document.getElementById("pdfContainer");
+  const pickBtn = document.getElementById("pickPdfBtn");
 
+   pickBtn.addEventListener("click", () => {
+  input.click();
+});
   // ---- UI mode helpers ----
   let viewerMode = true; // true => UI hidden ("viewer-mode"), false => UI visible ("ui-visible")
 
