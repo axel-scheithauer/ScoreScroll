@@ -1,16 +1,24 @@
 // app.js
-// PDF.js: render all pages, then "cut mode":
-// - pinch to zoom (scale inner content)
-// - pan by normal scrolling in #pdfContainer
-// - 1-finger long-press near screen center: capture current viewport as a region, overlay it light transparent red
-// - regions may overlap
-// - 2-finger long-press near screen center: finish cut mode -> render all captured regions as a horizontal strip
+// PDF.js score viewer with cut-regions persistence + gesture controls.
 //
-// Assumes in HTML:
-//   <button id="pickPdfBtn" type="button">...</button>
-//   <input type="file" id="pdfInput" accept="application/pdf">
-//   <div id="pdfContainer"></div>
-// And pdf.js loaded (pdfjsLib available)
+// Gestures:
+// - 1-finger LONG PRESS near screen center (still) in PDF mode:
+//     -> save current viewport as a region + light red overlay + haptic (best-effort)
+// - 3-finger LONG PRESS near screen center (still) in ANY mode:
+//     -> toggle mode
+//        PDF  -> STRIP (save regions first)
+//        STRIP-> PDF   (reload PDF, show saved overlays)
+// - 3-finger SWIPE (move) in ANY mode:
+//     DOWN -> show UI bar
+//     UP   -> hide UI bar
+// Pinch-zoom:
+// - 2-finger pinch works in PDF mode (scale inner content).
+//
+// Persistence:
+// - Regions are saved per PDF in localStorage on PDF->STRIP toggle.
+// - When the same PDF is opened again, regions are loaded and STRIP is shown immediately.
+//
+// Identity of a PDF is approximated by SHA-256 of first 256KB + size + lastModified.
 
 document.addEventListener("DOMContentLoaded", () => {
   const input = document.getElementById("pdfInput");
@@ -18,7 +26,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const pdfContainer = document.getElementById("pdfContainer");
 
   // ----------------------------
-  // UI show/hide (optional)
+  // UI show/hide
   // ----------------------------
   function showUI() {
     document.body.classList.remove("viewer-mode");
@@ -29,7 +37,6 @@ document.addEventListener("DOMContentLoaded", () => {
     document.body.classList.add("viewer-mode");
   }
   showUI();
-
   pickBtn?.addEventListener("click", () => input.click());
 
   // ----------------------------
@@ -49,14 +56,66 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
   function hapticSave() {
-    haptic(20); // single tick
+    haptic(20);
   }
-  function hapticFinish() {
-    haptic([15, 40, 15]); // double tick
+  function hapticToggle() {
+    haptic([15, 40, 15]);
   }
 
   // ----------------------------
-  // Zoom infrastructure
+  // Persistence
+  // ----------------------------
+  const STORAGE_PREFIX = "scrollscore.cuts.v1:";
+  let currentFileKey = null;
+  let lastFile = null;
+
+  async function sha256Hex(buffer) {
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    const bytes = new Uint8Array(digest);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return hex;
+  }
+
+  async function computeFileKey(file) {
+    const N = 256 * 1024; // 256 KB
+    const slice = file.slice(0, Math.min(N, file.size));
+    const buf = await slice.arrayBuffer();
+    const headHash = await sha256Hex(buf);
+    return `${STORAGE_PREFIX}${headHash}:${file.size}:${file.lastModified || 0}`;
+  }
+
+  function saveCuts(fileKey, regionsToSave) {
+    try {
+      localStorage.setItem(fileKey, JSON.stringify({ regions: regionsToSave }));
+    } catch (e) {
+      console.warn("Could not save cuts:", e);
+    }
+  }
+
+  function loadCuts(fileKey) {
+    try {
+      const raw = localStorage.getItem(fileKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.regions)) return null;
+
+      const ok = parsed.regions.every(
+        (r) =>
+          r &&
+          typeof r.x === "number" &&
+          typeof r.y === "number" &&
+          typeof r.w === "number" &&
+          typeof r.h === "number"
+      );
+      return ok ? parsed.regions : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ----------------------------
+  // Zoom infrastructure (PDF mode)
   // ----------------------------
   let pdfContent = null;
   let currentScale = 1.0;
@@ -74,16 +133,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function setScale(newScale) {
     const clamped = Math.max(0.6, Math.min(3.0, newScale));
-    const oldScale = currentScale;
     currentScale = clamped;
-
     if (!pdfContent) return;
 
     pdfContent.style.transform = `scale(${currentScale})`;
 
     const baseW = Number(pdfContent.dataset.baseWidth || "0");
     const baseH = Number(pdfContent.dataset.baseHeight || "0");
-
     if (baseW && baseH) {
       pdfContent.style.width = `${baseW}px`;
       pdfContent.style.height = `${baseH}px`;
@@ -103,14 +159,11 @@ document.addEventListener("DOMContentLoaded", () => {
       sizer.style.height = `${baseH * currentScale}px`;
     }
 
-    // Keep overlays correct (they are in unscaled coords)
     updateOverlays();
-
-    return oldScale;
   }
 
   // ----------------------------
-  // Page layout tracking
+  // Page layout tracking (for strip extraction)
   // ----------------------------
   let pageLayouts = []; // { pageNumber, top, left, width, height, canvas, dpr }
 
@@ -156,9 +209,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  function addRegion(region) {
-    regions.push(region);
-
+  function addOverlayForRegion(region) {
+    if (!pdfContent) return;
     const ov = document.createElement("div");
     ov.className = "cutOverlay";
     ov.style.position = "absolute";
@@ -166,11 +218,21 @@ document.addEventListener("DOMContentLoaded", () => {
     ov.style.border = "1px solid rgba(255, 120, 120, 0.55)";
     ov.style.boxSizing = "border-box";
     ov.style.pointerEvents = "none";
-
     pdfContent.appendChild(ov);
     overlays.push(ov);
-
     positionOverlay(ov, region);
+  }
+
+  function refreshOverlaysFromRegions() {
+    overlays.forEach((el) => el.remove());
+    overlays.length = 0;
+    if (mode !== MODE.PDF) return;
+    for (const r of regions) addOverlayForRegion(r);
+  }
+
+  function addRegion(region, withOverlay = true) {
+    regions.push(region);
+    if (withOverlay && mode === MODE.PDF) addOverlayForRegion(region);
   }
 
   function captureCurrentViewportAsRegion() {
@@ -178,7 +240,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const y = pdfContainer.scrollTop / currentScale;
     const w = pdfContainer.clientWidth / currentScale;
     const h = pdfContainer.clientHeight / currentScale;
-    addRegion({ x, y, w, h });
+    addRegion({ x, y, w, h }, true);
+  }
+
+  function setRegionsFromSaved(saved) {
+    clearRegions();
+    for (const r of saved) regions.push({ x: r.x, y: r.y, w: r.w, h: r.h });
   }
 
   // ----------------------------
@@ -189,98 +256,48 @@ document.addEventListener("DOMContentLoaded", () => {
     const cy = window.innerHeight / 2;
     const dx = clientX - cx;
     const dy = clientY - cy;
-    return Math.sqrt(dx * dx + dy * dy) < 90; // radius
+    return Math.sqrt(dx * dx + dy * dy) < 90;
   }
 
   // ----------------------------
-  // Long-press gestures
-  // 1 finger long-press => save region
-  // 2 finger long-press => finish to strip
-  // Cancel if movement exceeds tolerance or finger count changes
+  // 1-finger LONG PRESS in PDF mode -> save region
   // ----------------------------
   const SAVE_LONG_MS = 550;
-  const FINISH_LONG_MS = 800;
   const MOVE_TOLERANCE_PX = 14;
 
-  let lpTimer = null;
-  let lpKind = null; // "save" | "finish"
-  let lpActive = false;
-  let lpStartPts = []; // [{x,y},...]
+  let saveTimer = null;
+  let saveActive = false;
+  let saveStartPt = null;
 
-  function cancelLongPress() {
-    if (lpTimer) clearTimeout(lpTimer);
-    lpTimer = null;
-    lpKind = null;
-    lpActive = false;
-    lpStartPts = [];
+  function cancelSaveLongPress() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    saveActive = false;
+    saveStartPt = null;
   }
 
-  function startLongPress(kind) {
-    cancelLongPress();
-    lpActive = true;
-    lpKind = kind;
-
-    const ms = kind === "finish" ? FINISH_LONG_MS : SAVE_LONG_MS;
-
-    lpTimer = setTimeout(async () => {
-      if (!lpActive) return;
-
-      // Fire!
-      if (mode !== MODE.PDF) return;
-      if (kind === "save") {
-        captureCurrentViewportAsRegion();
-        hapticSave();
-      } else if (kind === "finish") {
-        hapticFinish();
-        await finishCutModeToStrip();
-      }
-
-      cancelLongPress();
-    }, ms);
-  }
-
-  function movedTooMuch(touches) {
-    // Compare each touch to its start point (by index; stable enough for our use)
-    for (let i = 0; i < touches.length; i++) {
-      const t = touches[i];
-      const s = lpStartPts[i];
-      if (!s) return true;
-      const dx = t.clientX - s.x;
-      const dy = t.clientY - s.y;
-      if (Math.sqrt(dx * dx + dy * dy) > MOVE_TOLERANCE_PX) return true;
-    }
-    return false;
-  }
-
-  // We'll attach the long-press detection to the whole document (works anywhere),
-  // but only triggers when touches start near center.
   document.addEventListener(
     "touchstart",
     (e) => {
       if (mode !== MODE.PDF) return;
+      if (e.touches.length !== 1) return;
 
-      const n = e.touches.length;
-      if (n !== 1 && n !== 2) {
-        cancelLongPress();
-        return;
-      }
+      const t = e.touches[0];
+      if (!isNearCenter(t.clientX, t.clientY)) return;
 
-      // Must start near center (use first touch as reference)
-      const t0 = e.touches[0];
-      if (!isNearCenter(t0.clientX, t0.clientY)) {
-        cancelLongPress();
-        return;
-      }
+      saveActive = true;
+      saveStartPt = { x: t.clientX, y: t.clientY };
 
-      // Record start points
-      lpStartPts = [];
-      for (let i = 0; i < n; i++) {
-        lpStartPts.push({ x: e.touches[i].clientX, y: e.touches[i].clientY });
-      }
+      cancelSaveLongPress();
+      saveTimer = setTimeout(() => {
+        if (!saveActive) return;
+        if (mode !== MODE.PDF) return;
 
-      // Start appropriate long-press
-      if (n === 1) startLongPress("save");
-      if (n === 2) startLongPress("finish");
+        captureCurrentViewportAsRegion();
+        hapticSave();
+
+        cancelSaveLongPress();
+      }, SAVE_LONG_MS);
     },
     { passive: true }
   );
@@ -288,42 +305,25 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener(
     "touchmove",
     (e) => {
-      if (!lpActive) return;
+      if (!saveActive) return;
       if (mode !== MODE.PDF) return;
-
-      // If finger count changes, cancel
-      if (e.touches.length !== lpStartPts.length) {
-        cancelLongPress();
+      if (e.touches.length !== 1) {
+        cancelSaveLongPress();
         return;
       }
 
-      // If moved too much -> cancel (this also makes pinch zoom cancel finish gesture)
-      if (movedTooMuch(e.touches)) {
-        cancelLongPress();
-      }
+      const t = e.touches[0];
+      const d = Math.hypot(t.clientX - saveStartPt.x, t.clientY - saveStartPt.y);
+      if (d > MOVE_TOLERANCE_PX) cancelSaveLongPress();
     },
     { passive: true }
   );
 
-  document.addEventListener(
-    "touchend",
-    () => {
-      // Release cancels (unless it already fired)
-      cancelLongPress();
-    },
-    { passive: true }
-  );
-
-  document.addEventListener(
-    "touchcancel",
-    () => cancelLongPress(),
-    { passive: true }
-  );
+  document.addEventListener("touchend", () => cancelSaveLongPress(), { passive: true });
+  document.addEventListener("touchcancel", () => cancelSaveLongPress(), { passive: true });
 
   // ----------------------------
-  // Pinch zoom (two fingers) on pdfContainer
-  // (Note: our long-press finish uses 2 fingers but requires "still holding".
-  // Pinch movement cancels long-press via MOVE_TOLERANCE.)
+  // Pinch zoom in PDF mode (2 fingers)
   // ----------------------------
   let pinchActive = false;
   let pinchStartDist = 0;
@@ -355,8 +355,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!pinchActive) return;
       if (e.touches.length !== 2) return;
 
-      // prevent browser zoom
-      e.preventDefault();
+      e.preventDefault(); // prevent browser zoom
 
       const dNow = dist(e.touches[0], e.touches[1]);
       const factor = dNow / pinchStartDist;
@@ -384,9 +383,143 @@ document.addEventListener("DOMContentLoaded", () => {
   );
 
   // ----------------------------
-  // Rendering PDF (all pages)
+  // 3-finger SWIPE to show/hide UI (ANY mode)
   // ----------------------------
-  async function loadPdf(file) {
+  let threeSwipeStartY = null;
+  let threeSwipeStartTime = 0;
+  let threeSwipeActive = false;
+
+  document.addEventListener(
+    "touchstart",
+    (e) => {
+      if (e.touches.length === 3) {
+        threeSwipeActive = true;
+        threeSwipeStartY = e.touches[0].clientY;
+        threeSwipeStartTime = Date.now();
+      }
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    "touchend",
+    (e) => {
+      if (!threeSwipeActive || threeSwipeStartY == null) return;
+      if (e.touches && e.touches.length > 0) return;
+
+      const endY = e.changedTouches?.[0]?.clientY;
+      if (typeof endY !== "number") {
+        threeSwipeActive = false;
+        threeSwipeStartY = null;
+        return;
+      }
+
+      const dy = endY - threeSwipeStartY; // down:+ up:-
+      const dt = Date.now() - threeSwipeStartTime;
+
+      // If it was a swipe, cancel the 3-finger long-press toggle (defined below)
+      cancelThreeToggle();
+
+      if (dt < 700) {
+        if (dy > 80) showUI();
+        else if (dy < -80) hideUI();
+      }
+
+      threeSwipeActive = false;
+      threeSwipeStartY = null;
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    "touchcancel",
+    () => {
+      threeSwipeActive = false;
+      threeSwipeStartY = null;
+    },
+    { passive: true }
+  );
+
+  // ----------------------------
+  // 3-finger LONG PRESS (still) in center: toggle PDF <-> STRIP (ANY mode)
+  // ----------------------------
+  const THREE_TOGGLE_MS = 750;
+  const THREE_TOGGLE_MOVE_TOLERANCE_PX = 14;
+
+  let threeToggleTimer = null;
+  let threeToggleActive = false;
+  let threeToggleStartPts = null;
+
+  function cancelThreeToggle() {
+    if (threeToggleTimer) clearTimeout(threeToggleTimer);
+    threeToggleTimer = null;
+    threeToggleActive = false;
+    threeToggleStartPts = null;
+  }
+
+  function threeMovedTooMuch(touches) {
+    for (let i = 0; i < 3; i++) {
+      const t = touches[i];
+      const s = threeToggleStartPts[i];
+      const d = Math.hypot(t.clientX - s.x, t.clientY - s.y);
+      if (d > THREE_TOGGLE_MOVE_TOLERANCE_PX) return true;
+    }
+    return false;
+  }
+
+  document.addEventListener(
+    "touchstart",
+    (e) => {
+      if (e.touches.length !== 3) return;
+
+      const t0 = e.touches[0];
+      if (!isNearCenter(t0.clientX, t0.clientY)) return;
+
+      threeToggleStartPts = [
+        { x: e.touches[0].clientX, y: e.touches[0].clientY },
+        { x: e.touches[1].clientX, y: e.touches[1].clientY },
+        { x: e.touches[2].clientX, y: e.touches[2].clientY },
+      ];
+      threeToggleActive = true;
+
+      cancelThreeToggle();
+      threeToggleTimer = setTimeout(async () => {
+        if (!threeToggleActive) return;
+
+        hapticToggle();
+
+        if (mode === MODE.PDF) {
+          await finishCutModeToStrip(true /*save*/);
+        } else if (mode === MODE.STRIP) {
+          await returnToPdfModeWithOverlays();
+        }
+
+        cancelThreeToggle();
+      }, THREE_TOGGLE_MS);
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    "touchmove",
+    (e) => {
+      if (!threeToggleActive) return;
+      if (e.touches.length !== 3) {
+        cancelThreeToggle();
+        return;
+      }
+      if (threeMovedTooMuch(e.touches)) cancelThreeToggle();
+    },
+    { passive: true }
+  );
+
+  document.addEventListener("touchend", () => cancelThreeToggle(), { passive: true });
+  document.addEventListener("touchcancel", () => cancelThreeToggle(), { passive: true });
+
+  // ----------------------------
+  // Load / render PDF (all pages)
+  // ----------------------------
+  async function loadPdf(file, savedRegions) {
     mode = MODE.PDF;
     clearRegions();
     ensurePdfContentWrapper();
@@ -396,8 +529,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const numPages = pdf.numPages;
     const dpr = window.devicePixelRatio || 1;
-
-    // Render quality: tune if needed
     const renderScale = 1.5;
 
     let contentWidth = 0;
@@ -424,6 +555,7 @@ document.addEventListener("DOMContentLoaded", () => {
       canvas.style.left = "0px";
       canvas.style.top = `${yOffset}px`;
       canvas.style.background = "#fff";
+      canvas.style.margin = "0";
 
       canvas.dataset.pageNumber = String(pageNumber);
       canvas.dataset.top = String(yOffset);
@@ -454,29 +586,54 @@ document.addEventListener("DOMContentLoaded", () => {
     hideUI();
     pdfContainer.scrollTop = 0;
     pdfContainer.scrollLeft = 0;
+
+    // If saved regions are provided: jump directly to STRIP
+    if (Array.isArray(savedRegions) && savedRegions.length > 0) {
+      setRegionsFromSaved(savedRegions);
+      await finishCutModeToStrip(false /*save*/);
+    } else {
+      // Otherwise show overlays for existing regions (usually none)
+      refreshOverlaysFromRegions();
+    }
   }
 
-  input.addEventListener("change", () => {
+  input.addEventListener("change", async () => {
     const file = input.files?.[0];
     if (!file) return;
 
-    loadPdf(file).catch((err) => {
+    try {
+      lastFile = file;
+      currentFileKey = await computeFileKey(file);
+
+      const saved = loadCuts(currentFileKey);
+      await loadPdf(file, saved);
+    } catch (err) {
       console.error(err);
       showUI();
-    });
+    }
   });
 
   // ----------------------------
-  // Finish cut mode => horizontal strip
+  // PDF -> STRIP (optionally save)
   // ----------------------------
-  async function finishCutModeToStrip() {
+  async function finishCutModeToStrip(shouldSave) {
     mode = MODE.STRIP;
     hideUI();
 
-    // remove overlays
+    if (shouldSave && currentFileKey) {
+      saveCuts(currentFileKey, regions);
+    }
+
+    // Remove overlays (strip doesn't show them)
     overlays.forEach((el) => el.remove());
     overlays.length = 0;
 
+    // Keep pageLayouts + original canvases alive? We replace DOM, but we need pixel sources.
+    // We can still render strip from current page canvases before wiping. So:
+    // 1) Build strip canvases now
+    const stripCanvases = buildStripCanvasesFromRegions();
+
+    // 2) Replace UI with strip
     pdfContainer.innerHTML = "";
 
     const strip = document.createElement("div");
@@ -489,29 +646,30 @@ document.addEventListener("DOMContentLoaded", () => {
     strip.style.background = "#000";
     strip.style.padding = "0";
     strip.style.margin = "0";
-
-    // eliminate any inline-block whitespace gaps
     strip.style.fontSize = "0";
     strip.style.lineHeight = "0";
-
     strip.style.webkitOverflowScrolling = "touch";
 
-    const targetCssHeight = window.innerHeight;
-    const targetDpr = window.devicePixelRatio || 1;
-
-    for (let i = 0; i < regions.length; i++) {
-      const r = regions[i];
-      const snippetCanvas = renderRegionToCanvas(r, targetCssHeight, targetDpr);
-
-      snippetCanvas.style.display = "inline-block";
-      snippetCanvas.style.verticalAlign = "top";
-      snippetCanvas.style.background = "#000";
-      snippetCanvas.style.marginRight = "0px";
-
-      strip.appendChild(snippetCanvas);
+    for (const c of stripCanvases) {
+      c.style.display = "inline-block";
+      c.style.verticalAlign = "top";
+      c.style.background = "#000";
+      c.style.marginRight = "0px";
+      strip.appendChild(c);
     }
 
     pdfContainer.appendChild(strip);
+  }
+
+  function buildStripCanvasesFromRegions() {
+    const targetCssHeight = window.innerHeight;
+    const targetDpr = window.devicePixelRatio || 1;
+    const canvases = [];
+
+    for (const r of regions) {
+      canvases.push(renderRegionToCanvas(r, targetCssHeight, targetDpr));
+    }
+    return canvases;
   }
 
   function renderRegionToCanvas(region, targetCssHeight, targetDpr) {
@@ -567,5 +725,23 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     return out;
+  }
+
+  // ----------------------------
+  // STRIP -> PDF (reload + overlays)
+  // ----------------------------
+  async function returnToPdfModeWithOverlays() {
+    if (!lastFile) return;
+
+    const saved = currentFileKey ? loadCuts(currentFileKey) : null;
+
+    // Load PDF but do NOT auto-strip
+    await loadPdf(lastFile, null);
+
+    // Restore regions + overlays
+    if (Array.isArray(saved) && saved.length > 0) {
+      setRegionsFromSaved(saved);
+      refreshOverlaysFromRegions();
+    }
   }
 });
